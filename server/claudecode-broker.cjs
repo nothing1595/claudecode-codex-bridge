@@ -38,6 +38,11 @@ const GATEWAY_BACKOFF_MS = Number(process.env.CCB_GATEWAY_BACKOFF_MS || 800);
 const GATEWAY_REQUIRED = process.env.CCB_GATEWAY_REQUIRED !== "0";
 const GATEWAY_HEALTH_TTL_MS = Number(process.env.CCB_GATEWAY_HEALTH_TTL_MS || 30_000);
 const DEFAULT_ALLOWED_GATEWAY_URLS = "http://127.0.0.1:8317,http://localhost:8317";
+// 429 circuit breaker: after N consecutive jobs fail from rate limiting, refuse
+// all dispatches for a cooldown so a retry-happy caller cannot burn the fresh
+// quota window (or hammer a dead backend) the moment it reopens.
+const RATE_LIMIT_THRESHOLD = Math.max(0, Number(process.env.CCB_RATE_LIMIT_THRESHOLD ?? 2));
+const RATE_LIMIT_COOLDOWN_MS = Number(process.env.CCB_RATE_LIMIT_COOLDOWN_MS || 30 * 60_000);
 
 function resolveHostUserProfile() {
   if (process.env.CCB_USER_PROFILE && fs.existsSync(process.env.CCB_USER_PROFILE)) {
@@ -351,6 +356,73 @@ function getGatewayConfig() {
     config.token = process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_API_KEY;
   }
   return config;
+}
+
+// ---------------------------------------------------------------------------
+// 429 Rate-Limit Circuit Breaker
+//
+// A single 429-exhausted turn already burns 10 SDK retries x upstream account
+// rotation inside the CPA. If consecutive jobs keep failing on quota, further
+// dispatches are refused for a cooldown window instead of letting a
+// retry-happy caller saturate the moment quota resets.
+
+const RATE_LIMIT_TEXT = /\b429\b|rate.?limit|resource has been exhausted|usage limit has been reached|quota/i;
+
+let rateLimitFailureStreak = 0;
+let rateLimitCooldownUntil = 0;
+
+function isRateLimitFailure(job) {
+  if (!job) return false;
+  if (job.sawRateLimit) return true;
+  const text = `${job.stderr || ""}\n${job.response || job.stdout || ""}`;
+  return RATE_LIMIT_TEXT.test(text);
+}
+
+// Called from settleJob for every settled job.
+function noteSettlementForRateLimit(job) {
+  if (RATE_LIMIT_THRESHOLD <= 0) return; // breaker disabled
+  if (job.status === "completed") {
+    // Something succeeded: quota is flowing again — fully reset the breaker.
+    if (rateLimitFailureStreak > 0 || rateLimitCooldownUntil > Date.now()) {
+      logEvent("rate-limit circuit breaker RESET (a job completed successfully)");
+    }
+    rateLimitFailureStreak = 0;
+    rateLimitCooldownUntil = 0;
+    return;
+  }
+  if (job.status !== "failed") return; // cancelled jobs leave the streak untouched
+  if (!isRateLimitFailure(job)) {
+    // Non-quota failure: don't count toward the breaker, don't reset either.
+    return;
+  }
+  rateLimitFailureStreak += 1;
+  if (rateLimitFailureStreak >= RATE_LIMIT_THRESHOLD) {
+    rateLimitCooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+    logEvent(`rate-limit circuit breaker OPEN after ${rateLimitFailureStreak} consecutive 429-failed jobs; dispatch refused for ${Math.round(RATE_LIMIT_COOLDOWN_MS / 60_000)}m`);
+  }
+}
+
+function getRateLimitBreakerState() {
+  const now = Date.now();
+  return {
+    enabled: RATE_LIMIT_THRESHOLD > 0,
+    open: now < rateLimitCooldownUntil,
+    streak: rateLimitFailureStreak,
+    threshold: RATE_LIMIT_THRESHOLD,
+    cooldown_remaining_s: Math.max(0, Math.round((rateLimitCooldownUntil - now) / 1000)),
+  };
+}
+
+function assertRateLimitBreaker() {
+  if (RATE_LIMIT_THRESHOLD <= 0) return;
+  const now = Date.now();
+  if (now >= rateLimitCooldownUntil) return;
+  const remainingMin = Math.ceil((rateLimitCooldownUntil - now) / 60_000);
+  throw new Error(
+    `CPA gateway rate-limit circuit breaker is OPEN: ${rateLimitFailureStreak} consecutive jobs failed with 429 quota exhaustion. ` +
+    `Dispatch refused for ~${remainingMin} more minute(s) so the quota window is not saturated the moment it reopens. ` +
+    `Wait for the cooldown, verify gateway quota, then retry (a single successful job also resets the breaker).`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1479,6 +1551,9 @@ function handleClaudeEventLine(session, rawLine) {
       }
 
       if (message.subtype === "api_retry") {
+        if (message.error_status === 429 || RATE_LIMIT_TEXT.test(String(message.error || ""))) {
+          activeJob.sawRateLimit = true;
+        }
         activeJob.progress = {
           ...(activeJob.progress || {}),
           last_activity_age_s: 0,
@@ -1621,6 +1696,7 @@ function settleJob(job) {
   job.settled = true;
   job.completedAt = new Date().toISOString();
   logEvent(`job ${job.jobId} settled with status: ${job.status}`);
+  noteSettlementForRateLimit(job);
 
   const session = sessions.get(job.sessionId);
   if (session) {
@@ -1648,6 +1724,9 @@ function settleJob(job) {
 // Job Dispatch & Execution
 
 async function startJob(args, isContinue = false) {
+  // 429 circuit breaker gate: refuse dispatch entirely while cooling down.
+  assertRateLimitBreaker();
+
   let session;
   if (isContinue) {
     const sessionId = args.session_id;
@@ -1692,6 +1771,7 @@ async function startJob(args, isContinue = false) {
     progress: null,
     eventSeq: 0,
     promptDispatched: false,
+    sawRateLimit: false,
     lastActivityMs: Date.now(),
     slotHeld: false,
     settled: false,
@@ -1908,6 +1988,7 @@ async function dispatch(method, params) {
   switch (method) {
     case "health": {
       const gatewayConfig = getGatewayConfig();
+      const gatewayHealth = await checkGatewayHealth(gatewayConfig);
       return {
         ...SERVER,
         active_jobs: hasActiveJobs(),
@@ -1920,7 +2001,8 @@ async function dispatch(method, params) {
         gateway_required: GATEWAY_REQUIRED,
         gateway_base_url: gatewayConfig.baseUrl || null,
         gateway_allowlist: getAllowedGatewayUrls(),
-        gateway_health: gatewayHealthCache.status ? gatewayHealthCache : null,
+        gateway_health: gatewayHealth,
+        rate_limit_breaker: getRateLimitBreakerState(),
         models_count: cachedModels ? cachedModels.length : 0,
         models_status: lastModelQueryDiagnostic,
         models_source: lastSuccessfulSource,
@@ -2121,6 +2203,10 @@ module.exports = {
   checkGatewayHealth,
   assertExecutionGateway,
   getRequiredClaudeExecutionEnv,
+  isRateLimitFailure,
+  noteSettlementForRateLimit,
+  getRateLimitBreakerState,
+  assertRateLimitBreaker,
   categorizeGatewayError,
   getBaseFamilyName,
   getEffortScore,

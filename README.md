@@ -91,6 +91,15 @@ Model-list caching is deliberately decoupled from execution: `list_models` may k
 
 Set `CCB_GATEWAY_REQUIRED=0` to restore the legacy fail-open (CPA-aware) behaviour for offline development.
 
+### 429 Rate-Limit Circuit Breaker
+
+A single quota-exhausted turn already burns ~10 SDK retries × upstream account rotation inside the CPA. If consecutive jobs keep failing on 429 (detected via `api_retry` events with HTTP 429, or rate-limit text in the result), the breaker opens and **all dispatches (`run_task` / `continue_task`) are refused for a cooldown** with a clear error — so a retry-happy caller cannot saturate the quota window the moment it reopens. Any successfully completed job fully resets the breaker; the cooldown also expires naturally (half-open: the next dispatch is a probe). State is visible in the `health` endpoint (`rate_limit_breaker`) and smoke tests self-skip while it is open or the gateway answers 429.
+
+| Variable | Default | Description |
+|---|---|---|
+| `CCB_RATE_LIMIT_THRESHOLD` | `2` | Consecutive 429-failed jobs before the breaker opens. `0` disables the breaker. |
+| `CCB_RATE_LIMIT_COOLDOWN_MS` | `1800000` (30m) | How long dispatch is refused after the breaker opens. |
+
 ---
 
 ## Key Advantages

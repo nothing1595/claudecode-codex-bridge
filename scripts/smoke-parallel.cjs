@@ -162,8 +162,25 @@ async function runParallelTest() {
   console.log("\n=== Parallel test passed successfully! ===");
 }
 
+// Pre-dispatch guard: refuse to burn quota when the gateway is rate-limited
+// or the broker's 429 circuit breaker is open.
+async function assertGatewayDispatchable() {
+  const h = await brokerRequest("health", {});
+  const breaker = h.rate_limit_breaker;
+  if (breaker && breaker.open) {
+    console.warn(`TEST SKIPPED: broker 429 circuit breaker is OPEN (streak ${breaker.streak}/${breaker.threshold}, cooldown ${Math.ceil(breaker.cooldown_remaining_s / 60)}m remaining).`);
+    process.exit(2);
+  }
+  const gh = h.gateway_health;
+  if (gh && gh.status === "rate_limited") {
+    console.warn("TEST SKIPPED: CPA gateway is currently rate-limited (HTTP 429 on /v1/models).");
+    process.exit(2);
+  }
+}
+
 async function main() {
   await ensureBroker();
+  await assertGatewayDispatchable();
   if (isCancelTest) {
     await runCancelTest();
   } else {

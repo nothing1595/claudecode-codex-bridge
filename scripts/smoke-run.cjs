@@ -86,9 +86,28 @@ async function pollUntilFinished(jobId) {
   throw new Error(`Smoke-test observation window exhausted (60 x 10s); broker job ${jobId} may still be active — query get_status directly or raise the observation budget.`);
 }
 
+// Pre-dispatch guard: refuse to burn quota when the gateway is rate-limited
+// or the broker's 429 circuit breaker is open.
+async function assertGatewayDispatchable() {
+  const h = await brokerRequest("health", {});
+  const breaker = h.rate_limit_breaker;
+  if (breaker && breaker.open) {
+    console.warn(`SMOKE SKIPPED: broker 429 circuit breaker is OPEN (streak ${breaker.streak}/${breaker.threshold}, cooldown ${Math.ceil(breaker.cooldown_remaining_s / 60)}m remaining).`);
+    console.warn("Wait for the cooldown or a successful job to reset it, then re-run.");
+    process.exit(2);
+  }
+  const gh = h.gateway_health;
+  if (gh && gh.status === "rate_limited") {
+    console.warn("SMOKE SKIPPED: CPA gateway is currently rate-limited (HTTP 429 on /v1/models).");
+    console.warn("Running now would burn the fresh quota window on retries — wait for quota to recover.");
+    process.exit(2);
+  }
+}
+
 async function main() {
   await ensureBroker();
   console.log(`Broker healthy on 127.0.0.1:${BROKER_PORT}`);
+  await assertGatewayDispatchable();
 
   // Test 1: list_models
   console.log("\n=== Test 1: list_models dynamic discovery ===");

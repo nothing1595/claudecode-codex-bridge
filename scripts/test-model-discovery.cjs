@@ -269,6 +269,57 @@ async function runTests() {
   if (savedAllowlist === undefined) delete process.env.CCB_ALLOWED_GATEWAY_URLS;
   else process.env.CCB_ALLOWED_GATEWAY_URLS = savedAllowlist;
 
+  // -------------------------------------------------------------------------
+  // Test 9: 429 rate-limit circuit breaker state machine
+  // -------------------------------------------------------------------------
+  console.log("\n[Test 9] 429 circuit breaker...");
+  // start from a clean slate
+  broker.noteSettlementForRateLimit({ status: "completed" });
+  assert.strictEqual(broker.getRateLimitBreakerState().streak, 0, "Streak should start at 0");
+
+  // detection: api_retry flag and result-text matching both count as 429
+  assert.strictEqual(broker.isRateLimitFailure({ sawRateLimit: true }), true, "sawRateLimit flag must be detected");
+  assert.strictEqual(
+    broker.isRateLimitFailure({ stderr: "", response: "API Error: Request rejected (429) · Resource has been exhausted" }),
+    true,
+    "429 result text must be detected",
+  );
+  assert.strictEqual(
+    broker.isRateLimitFailure({ stderr: "claude CLI closed with code 1" }),
+    false,
+    "non-quota failures must not be detected as rate-limit",
+  );
+
+  // one 429 failure: streak 1, breaker still closed, dispatch allowed
+  broker.noteSettlementForRateLimit({ status: "failed", sawRateLimit: true });
+  let breaker = broker.getRateLimitBreakerState();
+  assert.strictEqual(breaker.streak, 1);
+  assert.strictEqual(breaker.open, false, "Breaker must stay closed below threshold (2)");
+  broker.assertRateLimitBreaker(); // must not throw
+
+  // non-quota failure does not advance the streak
+  broker.noteSettlementForRateLimit({ status: "failed", stderr: "spawn ENOENT" });
+  assert.strictEqual(broker.getRateLimitBreakerState().streak, 1, "Non-quota failure must not count");
+
+  // cancelled jobs neither count nor reset
+  broker.noteSettlementForRateLimit({ status: "cancelled" });
+  assert.strictEqual(broker.getRateLimitBreakerState().streak, 1, "Cancelled job must not change the streak");
+
+  // second 429 failure: breaker opens, dispatch refused
+  broker.noteSettlementForRateLimit({ status: "failed", response: "usage limit has been reached" });
+  breaker = broker.getRateLimitBreakerState();
+  assert.strictEqual(breaker.open, true, "Breaker must open at threshold");
+  assert.ok(breaker.cooldown_remaining_s > 0, "Cooldown must be positive");
+  await assert.rejects(async () => broker.assertRateLimitBreaker(), /circuit breaker is OPEN/, "Dispatch must be refused while open");
+
+  // a completed job fully resets (closes) the breaker
+  broker.noteSettlementForRateLimit({ status: "completed" });
+  breaker = broker.getRateLimitBreakerState();
+  assert.strictEqual(breaker.open, false, "Completed job must close the breaker");
+  assert.strictEqual(breaker.streak, 0);
+  broker.assertRateLimitBreaker(); // must not throw again
+  console.log("✓ 429 circuit breaker passed (threshold / non-quota / cancelled / open / reset)");
+
   // Cleanup
   delete process.env.CCB_GATEWAY_BASE_URL;
   delete process.env.CCB_GATEWAY_AUTH_TOKEN;

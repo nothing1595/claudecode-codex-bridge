@@ -168,7 +168,7 @@ const tools = [
   },
   {
     name: "run_task",
-    description: "Start a new persistent Claude Code CLI session in the specified workspace. Returns immediately with job_id and session_id. Extra jobs queue when the parallel limit is reached; poll job_id with get_status. Accepts model aliases (sonnet/opus/haiku/fable, cc_XXX_worker) or gateway slugs; omit model to use the user-configured default. CPA-only fail-closed: refuses to start when the local CPA gateway (ANTHROPIC_BASE_URL, allowlist 127.0.0.1:8317) is missing, off-allowlist, conflicting, or unreachable.",
+    description: "Start a new persistent Claude Code CLI session in the specified workspace. Returns immediately with job_id and session_id. Extra jobs queue when the parallel limit is reached; poll job_id with get_status. Accepts model aliases (sonnet/opus/haiku/fable, cc_XXX_worker) or gateway slugs; omit model to use the user-configured default. CPA-only fail-closed: refuses to start when the local CPA gateway (ANTHROPIC_BASE_URL, allowlist 127.0.0.1:8317) is missing, off-allowlist, conflicting, or unreachable. A 429 circuit breaker also refuses dispatch for a cooldown window after consecutive rate-limited job failures.",
     inputSchema: {
       type: "object",
       properties: {
