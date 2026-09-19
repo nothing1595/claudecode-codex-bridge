@@ -32,6 +32,12 @@ const MODELS_CACHE_TTL_MS = Number(process.env.CCB_MODELS_CACHE_TTL_MS || 5 * 60
 const GATEWAY_TIMEOUT_MS = Number(process.env.CCB_GATEWAY_TIMEOUT_MS || 12_000);
 const GATEWAY_RETRIES = Number(process.env.CCB_GATEWAY_RETRIES || 2);
 const GATEWAY_BACKOFF_MS = Number(process.env.CCB_GATEWAY_BACKOFF_MS || 800);
+// CPA-only fail-closed policy: Claude Code may ONLY ever talk to the local
+// CPA gateway. Set CCB_GATEWAY_REQUIRED=0 to restore legacy CPA-aware
+// (fail-open) behaviour for offline development.
+const GATEWAY_REQUIRED = process.env.CCB_GATEWAY_REQUIRED !== "0";
+const GATEWAY_HEALTH_TTL_MS = Number(process.env.CCB_GATEWAY_HEALTH_TTL_MS || 30_000);
+const DEFAULT_ALLOWED_GATEWAY_URLS = "http://127.0.0.1:8317,http://localhost:8317";
 
 function resolveHostUserProfile() {
   if (process.env.CCB_USER_PROFILE && fs.existsSync(process.env.CCB_USER_PROFILE)) {
@@ -305,22 +311,27 @@ let cachedModels = lastSuccessfulModels ? [...lastSuccessfulModels] : [...DEFAUL
 let cachedModelsTime = lastSuccessfulTimestamp;
 
 // Gateway configuration: env override first, then the host user's Claude Code
-// settings.json env block, then sane loopback defaults.
+// settings.json env block, then process env. settings.json is ALWAYS read
+// (even when CCB_* overrides are present) so the CPA-only conflict guard can
+// compare the override against what Claude Code itself would apply.
 function getGatewayConfig() {
   const config = {
     baseUrl: process.env.CCB_GATEWAY_BASE_URL || null,
     token: process.env.CCB_GATEWAY_AUTH_TOKEN || process.env.CCB_GATEWAY_TOKEN || null,
     source: "env",
+    settingsBaseUrl: null,
   };
-  if (config.baseUrl && config.token) return config;
 
   try {
     const settingsPath = path.join(HOST_USER_PROFILE, ".claude", "settings.json");
     if (fs.existsSync(settingsPath)) {
       const settingsEnv = JSON.parse(fs.readFileSync(settingsPath, "utf8")).env || {};
-      if (!config.baseUrl && settingsEnv.ANTHROPIC_BASE_URL) {
-        config.baseUrl = settingsEnv.ANTHROPIC_BASE_URL;
-        config.source = "claude_settings";
+      if (settingsEnv.ANTHROPIC_BASE_URL) {
+        config.settingsBaseUrl = settingsEnv.ANTHROPIC_BASE_URL;
+        if (!config.baseUrl) {
+          config.baseUrl = settingsEnv.ANTHROPIC_BASE_URL;
+          config.source = "claude_settings";
+        }
       }
       if (!config.token) {
         config.token = settingsEnv.ANTHROPIC_AUTH_TOKEN || settingsEnv.ANTHROPIC_API_KEY || null;
@@ -338,6 +349,179 @@ function getGatewayConfig() {
     config.token = process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_API_KEY;
   }
   return config;
+}
+
+// ---------------------------------------------------------------------------
+// CPA-only enforcement (fail-closed)
+//
+// Model discovery, execution environment injection, run_task preflight and the
+// URL allowlist all share getGatewayConfig(), so "list_models shows CPA models"
+// and "Claude Code actually talks to CPA" can no longer diverge.
+
+function normalizeGatewayUrl(url) {
+  return String(url || "").trim().replace(/\/+$/, "").toLowerCase();
+}
+
+function getAllowedGatewayUrls() {
+  const raw = process.env.CCB_ALLOWED_GATEWAY_URLS || DEFAULT_ALLOWED_GATEWAY_URLS;
+  return raw
+    .split(",")
+    .map((entry) => normalizeGatewayUrl(entry))
+    .filter(Boolean);
+}
+
+function assertGatewayAllowed(baseUrl) {
+  const allowed = getAllowedGatewayUrls();
+  const normalized = normalizeGatewayUrl(baseUrl);
+  if (!allowed.includes(normalized)) {
+    throw new Error(
+      `Refusing to launch Claude Code: gateway '${baseUrl}' is not in the CPA allowlist [${allowed.join(", ")}]. ` +
+      `Direct connections to Anthropic or any unknown endpoint are forbidden by this bridge (CPA-only policy).`,
+    );
+  }
+}
+
+let gatewayHealthCache = { key: null, status: null, httpStatus: null, message: null, timestamp: 0 };
+
+// Probe GET <base>/v1/models. 2xx = ok; 429 = rate_limited (gateway alive and
+// authenticated, quota exhausted — allowed to proceed, claude retries itself);
+// 401/403 = auth failure; anything else = gateway broken.
+function checkGatewayHealth(config = getGatewayConfig()) {
+  if (!config.baseUrl) {
+    return Promise.resolve({
+      status: "not_configured",
+      httpStatus: null,
+      message: "ANTHROPIC_BASE_URL is not configured anywhere (CCB_GATEWAY_BASE_URL, ~/.claude/settings.json, process env)",
+    });
+  }
+
+  const cacheKey = `${normalizeGatewayUrl(config.baseUrl)}|${(config.token || "").length}`;
+  const now = Date.now();
+  if (gatewayHealthCache.key === cacheKey && now - gatewayHealthCache.timestamp < GATEWAY_HEALTH_TTL_MS) {
+    return Promise.resolve({ ...gatewayHealthCache, cached: true });
+  }
+
+  return new Promise((resolve) => {
+    const base = config.baseUrl.replace(/\/+$/, "");
+    let url;
+    try {
+      url = new URL(`${base}/v1/models`);
+    } catch {
+      return resolve({ status: "invalid_base_url", httpStatus: null, message: `Invalid gateway base URL: ${config.baseUrl}` });
+    }
+
+    const headers = { "Accept": "application/json", "anthropic-version": "2023-06-01" };
+    if (config.token) {
+      headers["x-api-key"] = config.token;
+      headers["Authorization"] = `Bearer ${config.token}`;
+    }
+
+    const transport = url.protocol === "https:" ? https : http;
+    const request = transport.request(
+      {
+        hostname: url.hostname,
+        port: url.port || (url.protocol === "https:" ? 443 : 80),
+        path: `${url.pathname}${url.search}`,
+        method: "GET",
+        headers,
+        timeout: GATEWAY_TIMEOUT_MS,
+      },
+      (response) => {
+        response.resume(); // drain
+        response.on("end", () => {
+          const httpStatus = response.statusCode;
+          let status;
+          if (httpStatus >= 200 && httpStatus < 300) status = "ok";
+          else if (httpStatus === 429) status = "rate_limited";
+          else if (httpStatus === 401 || httpStatus === 403) status = "auth_permission";
+          else status = "error";
+          const result = {
+            status,
+            httpStatus,
+            message: `Gateway responded HTTP ${httpStatus} on /v1/models`,
+          };
+          gatewayHealthCache = { key: cacheKey, ...result, timestamp: Date.now() };
+          resolve(result);
+        });
+      },
+    );
+
+    request.on("timeout", () => request.destroy(new Error(`Gateway health check timed out after ${GATEWAY_TIMEOUT_MS}ms`)));
+    request.on("error", (err) => {
+      resolve({
+        status: err?.code === "ECONNREFUSED" || /econnrefused/i.test(err?.message || "") ? "gateway_unreachable" : err?.code === "ETIMEDOUT" || err?.code === "ECONNABORTED" ? "timeout" : "error",
+        httpStatus: null,
+        message: err?.message || String(err),
+      });
+    });
+    request.end();
+  });
+}
+
+// Fail-closed gate executed before every NEW session (run_task). Throws when
+// CPA is missing, misconfigured, allowlisted-out, conflicting, or unhealthy.
+async function assertExecutionGateway() {
+  const config = getGatewayConfig();
+
+  if (!GATEWAY_REQUIRED) {
+    logEvent("warning: CCB_GATEWAY_REQUIRED=0 — CPA-only enforcement disabled (fail-open legacy mode)");
+    return config;
+  }
+
+  if (!config.baseUrl) {
+    throw new Error(
+      "CPA gateway required: ANTHROPIC_BASE_URL is not configured (set env.ANTHROPIC_BASE_URL in ~/.claude/settings.json or CCB_GATEWAY_BASE_URL). Refusing to run_task.",
+    );
+  }
+  if (!config.token) {
+    throw new Error(
+      "CPA gateway required: ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY is not configured (set env.ANTHROPIC_AUTH_TOKEN in ~/.claude/settings.json or CCB_GATEWAY_AUTH_TOKEN). Refusing to run_task.",
+    );
+  }
+  assertGatewayAllowed(config.baseUrl);
+
+  // Claude Code re-applies its own settings.json env on top of the process env
+  // we inject; if the two disagree about the gateway URL we cannot guarantee
+  // CPA-only, so refuse instead of hoping injection wins.
+  if (config.settingsBaseUrl && normalizeGatewayUrl(config.settingsBaseUrl) !== normalizeGatewayUrl(config.baseUrl)) {
+    throw new Error(
+      `Conflicting gateway configuration: CCB_GATEWAY_BASE_URL='${config.baseUrl}' vs ~/.claude/settings.json ANTHROPIC_BASE_URL='${config.settingsBaseUrl}'. Resolve the conflict so Claude Code provably talks to the CPA gateway.`,
+    );
+  }
+
+  const health = await checkGatewayHealth(config);
+  if (health.status !== "ok" && health.status !== "rate_limited") {
+    throw new Error(
+      `CPA gateway preflight failed (${health.status}${health.httpStatus ? `, HTTP ${health.httpStatus}` : ""}): ${health.message}. Refusing to run_task — fix the gateway before dispatching tasks.`,
+    );
+  }
+  if (health.status === "rate_limited") {
+    logEvent("CPA gateway is alive but rate limited (429); dispatching anyway (claude retries internally)");
+  }
+  return config;
+}
+
+// Environment handed to every spawned claude.exe: the CPA base URL and token
+// are injected explicitly, and any ambient official API key is stripped so the
+// child can never silently fall back to api.anthropic.com.
+function getRequiredClaudeExecutionEnv() {
+  const env = getClaudeEnv();
+  const gateway = getGatewayConfig();
+
+  if (!GATEWAY_REQUIRED) return env;
+
+  if (!gateway.baseUrl) {
+    throw new Error("CPA gateway required: ANTHROPIC_BASE_URL is not configured. Refusing to launch Claude Code.");
+  }
+  if (!gateway.token) {
+    throw new Error("CPA gateway required: ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY is not configured. Refusing to launch Claude Code.");
+  }
+  assertGatewayAllowed(gateway.baseUrl);
+
+  env.ANTHROPIC_BASE_URL = gateway.baseUrl;
+  env.ANTHROPIC_AUTH_TOKEN = gateway.token;
+  delete env.ANTHROPIC_API_KEY; // never inherit a potential official key from the parent environment
+  return env;
 }
 
 function categorizeGatewayError(err, body = "") {
@@ -934,6 +1118,10 @@ function launchSessionViewer(session) {
 // Session & Subprocess Lifecycle
 
 async function createSession({ workspace, model: rawModel, effort: rawEffort, agent, permissionMode, timeoutMinutes }) {
+  // CPA-only fail-closed gate: refuse to even create a session when the
+  // gateway is missing / misconfigured / off-allowlist / unreachable.
+  await assertExecutionGateway();
+
   const resolved = await resolveModelSelection(rawModel);
   const sessionId = `csess_${randomUUID()}`;
   const logPath = path.join(SESSIONS_LOG_DIR, `${sessionId}.jsonl`);
@@ -1031,11 +1219,11 @@ function buildClaudeArgs(session) {
 function spawnClaudeProcess(session) {
   const args = buildClaudeArgs(session);
 
-  logEvent(`spawning claude in ${session.workspace} (model=${session.model || "configured-default"}, effort=${session.effort || "default"}, resume=${session.claudeSessionId || "none"})`);
+  logEvent(`spawning claude in ${session.workspace} (model=${session.model || "configured-default"}, effort=${session.effort || "default"}, resume=${session.claudeSessionId || "none"}, gateway=cpa-only)`);
 
   const child = spawn(CLAUDE_EXE, args, {
     cwd: session.workspace,
-    env: getClaudeEnv(),
+    env: getRequiredClaudeExecutionEnv(),
     windowsHide: true,
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -1597,7 +1785,8 @@ function publicJob(job, includeOutput = true) {
 
 async function dispatch(method, params) {
   switch (method) {
-    case "health":
+    case "health": {
+      const gatewayConfig = getGatewayConfig();
       return {
         ...SERVER,
         active_jobs: hasActiveJobs(),
@@ -1607,11 +1796,16 @@ async function dispatch(method, params) {
         user: os.userInfo().username,
         pid: process.pid,
         claude_exe: CLAUDE_EXE,
+        gateway_required: GATEWAY_REQUIRED,
+        gateway_base_url: gatewayConfig.baseUrl || null,
+        gateway_allowlist: getAllowedGatewayUrls(),
+        gateway_health: gatewayHealthCache.status ? gatewayHealthCache : null,
         models_count: cachedModels ? cachedModels.length : 0,
         models_status: lastModelQueryDiagnostic,
         models_source: lastSuccessfulSource,
         models_cache_file: MODELS_CACHE_FILE,
       };
+    }
 
     case "list_models":
       return await getAvailableModelFamilies(params);
@@ -1794,6 +1988,11 @@ module.exports = {
   MODELS_CACHE_DIR,
   getClaudeEnv,
   getGatewayConfig,
+  getAllowedGatewayUrls,
+  assertGatewayAllowed,
+  checkGatewayHealth,
+  assertExecutionGateway,
+  getRequiredClaudeExecutionEnv,
   categorizeGatewayError,
   getBaseFamilyName,
   getEffortScore,

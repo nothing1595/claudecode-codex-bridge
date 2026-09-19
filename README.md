@@ -33,6 +33,10 @@ Instead of proxying or pretending Claude is a native Codex model, this bridge wr
                              │
                   Claude Code Agent Harness (yolo or safe mode)
                              │
+                  CPA gateway (allowlist: 127.0.0.1:8317 / localhost:8317)
+                  — injected ANTHROPIC_BASE_URL/AUTH_TOKEN, API key stripped,
+                    preflight /v1/models health check, fail-closed
+                             │
                   Selected Model (alias, gateway slug, or user default)
                              │
                              ▼
@@ -60,6 +64,32 @@ When assigned in Codex:
    Omitting `model` omits `--model` entirely, so Claude Code applies the user's own configured default (`~/.claude/settings.json` / env). This is the recommended dispatch on gateway-proxied setups.
 3. **Execution**:
    Once chosen, `cc_worker` calls `run_task` with the chosen model to execute the implementation.
+
+---
+
+## CPA-Only Fail-Closed Routing
+
+This bridge does not merely *prefer* the local CPA gateway (CLIProxyAPI) — it **guarantees** that every Claude Code model request goes through it, and refuses to run otherwise. Model discovery, execution environment injection, `run_task` preflight and the URL allowlist all resolve from the **same** `getGatewayConfig()` chain (`CCB_GATEWAY_BASE_URL` / `CCB_GATEWAY_AUTH_TOKEN` → `~/.claude/settings.json` `env.ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` → process env), so "list_models shows CPA models" and "Claude actually talks to CPA" can never diverge.
+
+Enforcement happens at four layers:
+
+1. **URL allowlist** — the resolved gateway must be `http://127.0.0.1:8317` or `http://localhost:8317` (override via `CCB_ALLOWED_GATEWAY_URLS`). `https://api.anthropic.com` — or any other endpoint — is rejected outright.
+2. **Preflight health check** — every `run_task` (new session) probes `GET <gateway>/v1/models` first. Connection refused, timeout, 401/403, or any non-2xx (except 429) refuses dispatch with a clear error. 429 (quota exhausted) is treated as "gateway alive" and allowed to proceed since Claude Code retries internally.
+3. **Explicit environment injection** — spawned `claude.exe` processes receive `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` injected directly; any ambient `ANTHROPIC_API_KEY` inherited from the parent environment is deleted, so an official key can never silently take over.
+4. **Configuration conflict detection** — Claude Code re-applies its own `settings.json` env over the process environment; if `CCB_GATEWAY_BASE_URL` and `~/.claude/settings.json` `ANTHROPIC_BASE_URL` disagree, the bridge refuses to dispatch rather than gamble on which layer wins.
+
+The installer applies the same policy: missing gateway config, off-allowlist URLs, bad credentials, or an unreachable gateway abort the installation (fail-closed).
+
+Model-list caching is deliberately decoupled from execution: `list_models` may keep serving the persistent cache (`stale: true`) while the gateway is temporarily down — display stays available, but `run_task` remains hard-blocked until CPA is healthy again.
+
+| Situation | `list_models` | `run_task` |
+|---|---|---|
+| CPA healthy | live discovery | ✅ allowed |
+| CPA rate-limited (429) | cached/stale | ✅ allowed (Claude retries) |
+| CPA down / unreachable | cached/stale | ❌ refused (preflight failed) |
+| CPA misconfigured / off-allowlist / token missing | built-in/cached | ❌ refused |
+
+Set `CCB_GATEWAY_REQUIRED=0` to restore the legacy fail-open (CPA-aware) behaviour for offline development.
 
 ---
 
@@ -113,7 +143,7 @@ When assigned in Codex:
   - By default, returns an array of model family objects.
   - Each item includes `stale` (boolean), `source` (`gateway_models_api`, `file_cache`, or `built_in_defaults`), and optional `diagnostics`.
   - Passing `detailed=true` returns an envelope: `{ models, count, stale, source, diagnostics, timestamp }`.
-- **`run_task(workspace, task, model?, effort?, agent?, permission_mode?, timeout_minutes?)`**: Starts a persistent Claude Code session in the workspace. Supports model aliases (e.g. `cc_sonnet_worker`, `sonnet`), gateway slugs, or omitting `model` to use the user-configured default. Defaults to a 240-minute (4-hour) timeout for deep tasks.
+- **`run_task(workspace, task, model?, effort?, agent?, permission_mode?, timeout_minutes?)`**: Starts a persistent Claude Code session in the workspace. Supports model aliases (e.g. `cc_sonnet_worker`, `sonnet`), gateway slugs, or omitting `model` to use the user-configured default. Defaults to a 240-minute (4-hour) timeout for deep tasks. Fails closed when the CPA gateway is missing, off-allowlist, conflicting, or unreachable (see [CPA-Only Fail-Closed Routing](#cpa-only-fail-closed-routing)).
 - **`continue_task(session_id, task, timeout_minutes?)`**: Sends a follow-up turn prompt directly to the running session's stdin; lazily revives dead sessions via `--resume`.
 - **`get_status(job_id, wait_ms?)`**: Long-polling status and live progress telemetry.
 - **`cancel_task(job_id)`**: Gracefully stops the active turn and halts the subprocess tree.
@@ -161,6 +191,9 @@ Restart Codex, then ask it to assign **`cc_worker`**.
 | `CCB_SHOW_WINDOW` | `1` | Set to `1` to pop up the desktop CLI monitor window, `0` for headless. |
 | `CCB_GATEWAY_BASE_URL` | From `~/.claude/settings.json` | Override the model discovery gateway base URL (tests). |
 | `CCB_GATEWAY_AUTH_TOKEN` | From `~/.claude/settings.json` | Override the gateway auth token (tests). |
+| `CCB_GATEWAY_REQUIRED` | `1` | CPA-only fail-closed enforcement. `0` restores legacy fail-open behaviour. |
+| `CCB_ALLOWED_GATEWAY_URLS` | `http://127.0.0.1:8317,http://localhost:8317` | Comma-separated allowlist; Claude Code is only ever launched for gateways on this list. |
+| `CCB_GATEWAY_HEALTH_TTL_MS` | `30000` (30s) | Preflight health-check result cache TTL for `run_task`. |
 | `CCB_MODELS_CACHE_FILE` | `%USERPROFILE%\.claudecode-codex-bridge\models-cache.json` | Persistent model cache file path. |
 | `CCB_MODELS_CACHE_TTL_MS` | `300000` (5m) | In-memory models cache TTL. |
 | `CCB_GATEWAY_TIMEOUT_MS` | `12000` (12s) | Per-attempt timeout for gateway `/v1/models`. |

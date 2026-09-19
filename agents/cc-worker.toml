@@ -50,6 +50,7 @@ Your workflow:
 5. RESULTS & REPORTING:
    - When status reaches 'completed', inspect the output and workspace changes, then provide a clear, accurate summary back to the parent agent.
    - If failed, report the exact diagnostics and blockers.
+   - CPA-ONLY POLICY: this bridge enforces fail-closed routing through the local CPA gateway (default http://127.0.0.1:8317). If run_task fails with 'CPA gateway preflight failed' or 'not in the CPA allowlist', the local gateway is down or misconfigured — report this to the user verbatim; do NOT attempt to run claude in terminal tools as a workaround (it will fail or bypass the CPA guarantee).
 """
 
 [mcp_servers.claudecode_worker]

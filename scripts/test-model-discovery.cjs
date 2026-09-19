@@ -186,6 +186,89 @@ async function runTests() {
   assert.strictEqual(refusedCat.reason, "gateway_unreachable");
   console.log("✓ Error categorization passed");
 
+  // -------------------------------------------------------------------------
+  // Test 8: CPA-only fail-closed enforcement
+  // -------------------------------------------------------------------------
+  console.log("\n[Test 8] CPA-only fail-closed enforcement...");
+  const savedApiKey = process.env.ANTHROPIC_API_KEY;
+
+  // 8a. Off-allowlist gateway (api.anthropic.com) must be refused
+  process.env.CCB_GATEWAY_BASE_URL = "https://api.anthropic.com";
+  process.env.CCB_GATEWAY_AUTH_TOKEN = "official-key";
+  assert.throws(() => broker.assertGatewayAllowed("https://api.anthropic.com"), /not in the CPA allowlist/, "Official API endpoint must be rejected by allowlist");
+  assert.throws(() => broker.getRequiredClaudeExecutionEnv(), /allowlist/, "Execution env must refuse off-allowlist gateway");
+  await assert.rejects(() => broker.assertExecutionGateway(), /allowlist/, "run_task preflight must refuse off-allowlist gateway");
+
+  // For the remaining sub-tests, extend the allowlist with the fixture/dead
+  // loopback endpoints (8a already proved the default allowlist rejects
+  // non-local URLs).
+  const savedAllowlist = process.env.CCB_ALLOWED_GATEWAY_URLS;
+  process.env.CCB_ALLOWED_GATEWAY_URLS = `http://127.0.0.1:8317,http://localhost:8317,http://127.0.0.1:1,${fixture.url}`;
+
+  // 8b. Allowlisted but unreachable gateway must fail preflight
+  process.env.CCB_GATEWAY_BASE_URL = "http://127.0.0.1:1";
+  const unreachableHealth = await broker.checkGatewayHealth();
+  assert.strictEqual(unreachableHealth.status, "gateway_unreachable", `Dead gateway should report unreachable, got ${unreachableHealth.status}`);
+  await assert.rejects(
+    () => broker.assertExecutionGateway(),
+    /CPA gateway preflight failed|Conflicting gateway configuration/,
+    "run_task preflight must refuse an unreachable gateway (or the conflicting settings override)",
+  );
+
+  // 8c. Env override precedence: CCB_* env wins over settings.json / process env
+  //     (the missing-credentials guard cannot be exercised on a machine whose
+  //     ~/.claude/settings.json supplies a real CPA token, so precedence is
+  //     the observable contract here)
+  process.env.CCB_GATEWAY_BASE_URL = fixture.url;
+  process.env.CCB_GATEWAY_AUTH_TOKEN = "test-token";
+  process.env.ANTHROPIC_BASE_URL = "https://api.anthropic.com";
+  process.env.ANTHROPIC_AUTH_TOKEN = "ambient-official-token";
+  const resolvedConfig = broker.getGatewayConfig();
+  assert.strictEqual(resolvedConfig.baseUrl, fixture.url, "CCB_GATEWAY_BASE_URL must take precedence over everything");
+  assert.strictEqual(resolvedConfig.token, "test-token", "CCB_GATEWAY_AUTH_TOKEN must take precedence over everything");
+  delete process.env.ANTHROPIC_BASE_URL;
+  delete process.env.ANTHROPIC_AUTH_TOKEN;
+
+  // 8d. Healthy allowlisted gateway: env injection + official key stripping
+  process.env.CCB_GATEWAY_BASE_URL = fixture.url; // 127.0.0.1 is on the default allowlist
+  process.env.CCB_GATEWAY_AUTH_TOKEN = "test-token";
+  process.env.ANTHROPIC_API_KEY = "ambient-official-key";
+  const execEnv = broker.getRequiredClaudeExecutionEnv();
+  assert.strictEqual(execEnv.ANTHROPIC_BASE_URL, fixture.url, "Execution env must inject the CPA base URL");
+  assert.strictEqual(execEnv.ANTHROPIC_AUTH_TOKEN, "test-token", "Execution env must inject the CPA token");
+  assert.strictEqual(execEnv.ANTHROPIC_API_KEY, undefined, "Ambient official API key must be stripped");
+
+  const healthy = await broker.checkGatewayHealth({ baseUrl: fixture.url, token: "test-token" });
+  assert.strictEqual(healthy.status, "ok", `Fixture gateway should be healthy, got ${healthy.status}`);
+
+  // Conflict guard: when ~/.claude/settings.json pins a different base URL,
+  // an env override must fail closed (Claude Code would re-apply its own
+  // settings over our injection, so the divergence is unprovable-safe).
+  const hostProfile = process.env.CCB_USER_PROFILE
+    || (fs.existsSync("C:\\Users\\15869") ? "C:\\Users\\15869" : os.homedir());
+  const realSettingsPath = path.join(hostProfile, ".claude", "settings.json");
+  let settingsBaseUrl = null;
+  try {
+    if (fs.existsSync(realSettingsPath)) {
+      settingsBaseUrl = JSON.parse(fs.readFileSync(realSettingsPath, "utf8")).env?.ANTHROPIC_BASE_URL || null;
+    }
+  } catch { /* treat as absent */ }
+  if (settingsBaseUrl && settingsBaseUrl.replace(/\/+$/, "").toLowerCase() !== fixture.url) {
+    await assert.rejects(
+      () => broker.assertExecutionGateway(),
+      /Conflicting gateway configuration/,
+      "Env override diverging from settings.json must fail closed",
+    );
+  } else {
+    await broker.assertExecutionGateway(); // no conflicting settings -> fixture is authoritative
+  }
+  console.log("✓ CPA-only fail-closed passed (allowlist / unreachable / precedence / env injection / conflict guard)");
+
+  if (savedApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+  else process.env.ANTHROPIC_API_KEY = savedApiKey;
+  if (savedAllowlist === undefined) delete process.env.CCB_ALLOWED_GATEWAY_URLS;
+  else process.env.CCB_ALLOWED_GATEWAY_URLS = savedAllowlist;
+
   // Cleanup
   delete process.env.CCB_GATEWAY_BASE_URL;
   delete process.env.CCB_GATEWAY_AUTH_TOKEN;

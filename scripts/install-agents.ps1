@@ -44,36 +44,56 @@ foreach ($oldFile in $obsoleteWorkers) {
     }
 }
 
-# Dynamic Model Verification via the Anthropic-compatible gateway (/v1/models)
-Write-Host "`nValidating available models via the Claude Code gateway..." -ForegroundColor Yellow
-$availableModels = @()
+# CPA-only fail-closed validation: the bridge refuses to run Claude Code
+# unless every model request goes through the local CPA gateway, so the
+# installer must not succeed when the gateway is missing or unreachable.
+Write-Host "`nValidating CPA gateway (~/.claude/settings.json ANTHROPIC_BASE_URL -> /v1/models)..." -ForegroundColor Yellow
+$settingsPath = Join-Path $env:USERPROFILE '.claude\settings.json'
+$baseUrl = $null; $token = $null
+if (Test-Path -LiteralPath $settingsPath) {
+    $settings = Get-Content -Raw -LiteralPath $settingsPath | ConvertFrom-Json
+    if ($settings.env.ANTHROPIC_BASE_URL) { $baseUrl = $settings.env.ANTHROPIC_BASE_URL }
+    if ($settings.env.ANTHROPIC_AUTH_TOKEN) { $token = $settings.env.ANTHROPIC_AUTH_TOKEN }
+    if (-not $token -and $settings.env.ANTHROPIC_API_KEY) { $token = $settings.env.ANTHROPIC_API_KEY }
+}
+if (-not $baseUrl -and $env:CCB_GATEWAY_BASE_URL) { $baseUrl = $env:CCB_GATEWAY_BASE_URL }
+if (-not $baseUrl -and $env:ANTHROPIC_BASE_URL) { $baseUrl = $env:ANTHROPIC_BASE_URL }
+if (-not $token -and $env:CCB_GATEWAY_AUTH_TOKEN) { $token = $env:CCB_GATEWAY_AUTH_TOKEN }
+if (-not $token -and $env:ANTHROPIC_AUTH_TOKEN) { $token = $env:ANTHROPIC_AUTH_TOKEN }
+
+if (-not $baseUrl) {
+    throw "CPA gateway required: ANTHROPIC_BASE_URL is not configured (~/.claude/settings.json env or CCB_GATEWAY_BASE_URL). The bridge is CPA-only fail-closed and refuses to install without it."
+}
+if (-not $token) {
+    throw "CPA gateway required: ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY is not configured. The bridge is CPA-only fail-closed and refuses to install without it."
+}
+
+$allowedUrls = @('http://127.0.0.1:8317', 'http://localhost:8317')
+if ($env:CCB_ALLOWED_GATEWAY_URLS) {
+    $allowedUrls = @($env:CCB_ALLOWED_GATEWAY_URLS -split ',' | ForEach-Object { $_.Trim().TrimEnd('/').ToLower() })
+}
+$normalizedBaseUrl = $baseUrl.TrimEnd('/').ToLower()
+if ($allowedUrls -notcontains $normalizedBaseUrl) {
+    throw "Refusing to install: gateway '$baseUrl' is not in the CPA allowlist [$($allowedUrls -join ', ')]. Direct connections to Anthropic or unknown endpoints are forbidden (CPA-only policy)."
+}
+
+$headers = @{ 'Accept' = 'application/json'; 'anthropic-version' = '2023-06-01' }
+$headers['x-api-key'] = $token
+$headers['Authorization'] = "Bearer $token"
 try {
-    $prevEap = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    $settingsPath = Join-Path $env:USERPROFILE '.claude\settings.json'
-    $baseUrl = $null; $token = $null
-    if (Test-Path -LiteralPath $settingsPath) {
-        $settings = Get-Content -Raw -LiteralPath $settingsPath | ConvertFrom-Json
-        if ($settings.env.ANTHROPIC_BASE_URL) { $baseUrl = $settings.env.ANTHROPIC_BASE_URL }
-        if ($settings.env.ANTHROPIC_AUTH_TOKEN) { $token = $settings.env.ANTHROPIC_AUTH_TOKEN }
-    }
-    if (-not $baseUrl -and $env:ANTHROPIC_BASE_URL) { $baseUrl = $env:ANTHROPIC_BASE_URL }
-    if (-not $token -and $env:ANTHROPIC_AUTH_TOKEN) { $token = $env:ANTHROPIC_AUTH_TOKEN }
-    if ($baseUrl) {
-        $headers = @{ 'Accept' = 'application/json'; 'anthropic-version' = '2023-06-01' }
-        if ($token) {
-            $headers['x-api-key'] = $token
-            $headers['Authorization'] = "Bearer $token"
-        }
-        $response = Invoke-RestMethod -Uri "$($baseUrl.TrimEnd('/'))/v1/models" -Headers $headers -TimeoutSec 12
-        $availableModels = @($response.data | ForEach-Object { $_.id })
-        Write-Host "Found $($availableModels.Count) available models on the gateway." -ForegroundColor Green
-    } else {
-        Write-Warning "No ANTHROPIC_BASE_URL configured; list_models will serve built-in alias defaults."
-    }
-    $ErrorActionPreference = $prevEap
+    $response = Invoke-WebRequest -Uri "$($baseUrl.TrimEnd('/'))/v1/models" -Headers $headers -TimeoutSec 12 -UseBasicParsing
+    $availableModels = @((($response.Content | ConvertFrom-Json).data) | ForEach-Object { $_.id })
+    Write-Host "Found $($availableModels.Count) available models on the CPA gateway ($baseUrl)." -ForegroundColor Green
 } catch {
-    Write-Warning "Could not query the gateway /v1/models ($($_.Exception.Message)). Will proceed; broker serves cached/built-in defaults."
+    $status = $null
+    if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+    if ($status -eq 429) {
+        Write-Warning "CPA gateway is alive but rate limited (HTTP 429). Proceeding with installation."
+    } elseif ($status -eq 401 -or $status -eq 403) {
+        throw "CPA gateway rejected credentials (HTTP $status). Fix ANTHROPIC_AUTH_TOKEN in ~/.claude/settings.json before installing."
+    } else {
+        throw "CPA gateway health check failed ($($_.Exception.Message)). The bridge is CPA-only fail-closed; start the gateway on $baseUrl before installing."
+    }
 }
 
 function ConvertTo-TomlBasicStringValue([string]$Value) {
