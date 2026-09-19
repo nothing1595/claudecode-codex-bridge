@@ -81,7 +81,9 @@ async function pollUntilFinished(jobId) {
       return status;
     }
   }
-  throw new Error(`Job ${jobId} timed out`);
+  // This is the smoke runner giving up on OBSERVING, not a broker-side task
+  // timeout — the broker job may still be active within its own 4h deadline.
+  throw new Error(`Smoke-test observation window exhausted (60 x 10s); broker job ${jobId} may still be active — query get_status directly or raise the observation budget.`);
 }
 
 async function main() {

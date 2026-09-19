@@ -124,7 +124,8 @@ async function runParallelTest() {
         return s;
       }
     }
-    throw new Error(`Job ${jobId} timed out`);
+    // Smoke runner observation window exhausted, not a broker task timeout.
+    throw new Error(`Smoke-test observation window exhausted; broker job ${jobId} may still be active — query get_status directly or raise the observation budget.`);
   }
 
   // Periodic overlap checker

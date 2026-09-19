@@ -20,8 +20,8 @@ const BROKER_PORT = Number(process.env.CCB_BROKER_PORT || 19226);
 const MAX_PARALLEL_JOBS = Number(process.env.CCB_MAX_PARALLEL_JOBS || 2);
 const IDLE_EXIT_MS = Number(process.env.CCB_BROKER_IDLE_MS || 0); // 0 = persistent daemon (no auto-exit)
 const JOB_TTL_MS = 60 * 60_000;
-const TASK_IDLE_TIMEOUT_MS = Number(process.env.CCB_TASK_IDLE_TIMEOUT_MS || 10 * 60_000);
-const TASK_TOOL_IDLE_TIMEOUT_MS = Number(process.env.CCB_TASK_TOOL_IDLE_TIMEOUT_MS || 60 * 60_000);
+const TASK_IDLE_TIMEOUT_MS = Number(process.env.CCB_TASK_IDLE_TIMEOUT_MS || 30 * 60_000);
+const TASK_TOOL_IDLE_TIMEOUT_MS = Number(process.env.CCB_TASK_TOOL_IDLE_TIMEOUT_MS || 90 * 60_000);
 const TASK_HARD_TIMEOUT_MS = Number(process.env.CCB_TASK_TIMEOUT_MS || 4 * 60 * 60_000);
 const configuredDefaultTimeoutMinutes = Number(process.env.CCB_DEFAULT_TIMEOUT_MINUTES || 240);
 const DEFAULT_TIMEOUT_MINUTES = Number.isFinite(configuredDefaultTimeoutMinutes) && configuredDefaultTimeoutMinutes > 0
@@ -107,7 +107,6 @@ function getClaudeEnv() {
 }
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
-
 // In-memory data store
 const sessions = new Map(); // sessionId -> Session
 const jobs = new Map();     // jobId -> Job
@@ -228,6 +227,9 @@ const KNOWN_MODEL_ALIASES = {
 // Persistent Cache Paths & Helpers
 const MODELS_CACHE_DIR = process.env.CCB_CACHE_DIR || path.join(HOST_USER_PROFILE, ".claudecode-codex-bridge");
 const MODELS_CACHE_FILE = process.env.CCB_MODELS_CACHE_FILE || path.join(MODELS_CACHE_DIR, "models-cache.json");
+// Session registry persisted across broker restarts so continue_task survives
+// a broker crash/restart (the native claude_session_id is what matters).
+const SESSIONS_STORE_DIR = process.env.CCB_SESSIONS_DIR || path.join(MODELS_CACHE_DIR, "sessions");
 
 function loadPersistentCache(cacheFile = MODELS_CACHE_FILE) {
   try {
@@ -1083,6 +1085,92 @@ function writeSessionEvent(session, event) {
   } catch { /* best-effort write */ }
 }
 
+// ---------------------------------------------------------------------------
+// Session Persistence (broker restart recovery)
+//
+// Jobs are transient, but the csess_* -> claude_session_id mapping is durable:
+// after a broker restart, continue_task still works because the session record
+// (including the native --resume handle) is reloaded from disk.
+
+function persistSession(session) {
+  if (!session || !session.sessionId) return;
+  try {
+    fs.mkdirSync(SESSIONS_STORE_DIR, { recursive: true });
+    const record = {
+      sessionId: session.sessionId,
+      claudeSessionId: session.claudeSessionId || null,
+      workspace: session.workspace,
+      model: session.model || null,
+      effort: session.effort || null,
+      agent: session.agent || null,
+      permissionMode: session.permissionMode,
+      timeoutMinutes: session.timeoutMinutes,
+      createdAt: session.createdAt,
+      lastUsedAt: session.lastUsedAt,
+      savedAt: new Date().toISOString(),
+    };
+    const file = path.join(SESSIONS_STORE_DIR, `${session.sessionId}.json`);
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(record, null, 2), "utf8");
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    logEvent(`failed to persist session ${session.sessionId}: ${err?.message || err}`);
+  }
+}
+
+function deleteSessionFile(sessionId) {
+  try {
+    fs.rmSync(path.join(SESSIONS_STORE_DIR, `${sessionId}.json`), { force: true });
+  } catch { /* best-effort */ }
+}
+
+function restorePersistedSessions() {
+  let restored = 0;
+  try {
+    if (!fs.existsSync(SESSIONS_STORE_DIR)) return 0;
+    for (const entry of fs.readdirSync(SESSIONS_STORE_DIR)) {
+      if (!entry.endsWith(".json")) continue;
+      try {
+        const record = JSON.parse(fs.readFileSync(path.join(SESSIONS_STORE_DIR, entry), "utf8"));
+        if (!record?.sessionId || sessions.has(record.sessionId)) continue;
+        if (!record.workspace || !fs.statSync(record.workspace).isDirectory()) {
+          deleteSessionFile(record.sessionId);
+          continue;
+        }
+        sessions.set(record.sessionId, {
+          sessionId: record.sessionId,
+          claudeSessionId: record.claudeSessionId || null,
+          workspace: record.workspace,
+          model: record.model || null,
+          effort: record.effort || null,
+          agent: record.agent || null,
+          permissionMode: record.permissionMode === "safe" ? "safe" : "yolo",
+          timeoutMinutes: Number.isFinite(Number(record.timeoutMinutes)) && Number(record.timeoutMinutes) > 0
+            ? Number(record.timeoutMinutes)
+            : DEFAULT_TIMEOUT_MINUTES,
+          process: null,
+          processExited: true,
+          activeJobId: null,
+          logPath: path.join(SESSIONS_LOG_DIR, `${record.sessionId}.jsonl`),
+          viewerLaunched: true, // restored sessions never pop a new monitor window
+          createdAt: record.createdAt || new Date().toISOString(),
+          lastUsedAt: new Date().toISOString(), // restart counts as use; TTL clock restarts
+          restoredFromDisk: true,
+        });
+        restored += 1;
+      } catch (err) {
+        logEvent(`failed to restore session file ${entry}: ${err?.message || err}`);
+      }
+    }
+  } catch (err) {
+    logEvent(`failed to scan sessions store ${SESSIONS_STORE_DIR}: ${err?.message || err}`);
+  }
+  if (restored > 0) {
+    logEvent(`restored ${restored} persisted session(s) from ${SESSIONS_STORE_DIR} (continue_task survives broker restarts)`);
+  }
+  return restored;
+}
+
 const VIEWER_SCRIPT = path.join(__dirname, "..", "scripts", "claudecode-viewer.cjs");
 
 function launchSessionViewer(session) {
@@ -1125,6 +1213,7 @@ async function createSession({ workspace, model: rawModel, effort: rawEffort, ag
   const resolved = await resolveModelSelection(rawModel);
   const sessionId = `csess_${randomUUID()}`;
   const logPath = path.join(SESSIONS_LOG_DIR, `${sessionId}.jsonl`);
+  const requestedSessionTimeout = Number(timeoutMinutes);
   const session = {
     sessionId,
     claudeSessionId: null, // native Claude Code session id (--resume handle)
@@ -1133,7 +1222,9 @@ async function createSession({ workspace, model: rawModel, effort: rawEffort, ag
     effort: rawEffort || resolved.effort || null,
     agent: agent || null,
     permissionMode: permissionMode === "safe" ? "safe" : "yolo",
-    timeoutMinutes: Number(timeoutMinutes) || DEFAULT_TIMEOUT_MINUTES,
+    timeoutMinutes: Number.isFinite(requestedSessionTimeout) && requestedSessionTimeout > 0
+      ? requestedSessionTimeout
+      : DEFAULT_TIMEOUT_MINUTES,
     process: null,
     processExited: false,
     activeJobId: null,
@@ -1143,6 +1234,7 @@ async function createSession({ workspace, model: rawModel, effort: rawEffort, ag
     lastUsedAt: new Date().toISOString(),
   };
   sessions.set(sessionId, session);
+  persistSession(session);
   writeSessionEvent(session, {
     type: "meta",
     session_id: sessionId,
@@ -1258,6 +1350,7 @@ function spawnClaudeProcess(session) {
     if (activeJob) {
       activeJob.stderr = safeTail(activeJob.stderr + chunk);
       activeJob.lastActivityMs = Date.now();
+      activeJob.eventSeq += 1;
     }
     writeSessionEvent(session, { type: "stderr", text: chunk });
   });
@@ -1367,6 +1460,7 @@ function handleClaudeEventLine(session, rawLine) {
   if (!activeJob) return;
 
   activeJob.lastActivityMs = Date.now();
+  activeJob.eventSeq += 1;
 
   switch (message.type) {
     case "system": {
@@ -1374,6 +1468,7 @@ function handleClaudeEventLine(session, rawLine) {
         if (message.session_id) {
           session.claudeSessionId = message.session_id;
           activeJob.claudeSessionId = message.session_id;
+          persistSession(session);
         }
         if (message.model) {
           activeJob.resolvedModel = message.model;
@@ -1482,6 +1577,7 @@ function handleClaudeEventLine(session, rawLine) {
       if (message.session_id) {
         session.claudeSessionId = message.session_id;
         activeJob.claudeSessionId = message.session_id;
+        persistSession(session);
       }
       const isSuccess = message.subtype === "success" && !message.is_error;
       if (typeof message.result === "string" && message.result.length > 0) {
@@ -1541,6 +1637,7 @@ function settleJob(job) {
     if (session.activeJobId === job.jobId) {
       session.activeJobId = null;
       session.lastUsedAt = new Date().toISOString();
+      persistSession(session);
     }
   }
 
@@ -1569,7 +1666,12 @@ async function startJob(args, isContinue = false) {
     throw new Error("task is required");
   }
 
-  const timeoutMinutes = Number(args.timeout_minutes) || session.timeoutMinutes || DEFAULT_TIMEOUT_MINUTES;
+  // Strict positive-number validation: -1 / 0 / NaN are truthy traps for
+  // `Number(x) || default` and would produce immediate or negative deadlines.
+  const requestedTimeout = Number(args.timeout_minutes);
+  const timeoutMinutes = Number.isFinite(requestedTimeout) && requestedTimeout > 0
+    ? requestedTimeout
+    : session.timeoutMinutes || DEFAULT_TIMEOUT_MINUTES;
   const jobId = `cjob_${randomUUID()}`;
   const job = {
     jobId,
@@ -1588,6 +1690,8 @@ async function startJob(args, isContinue = false) {
     response: null,
     usage: null,
     progress: null,
+    eventSeq: 0,
+    promptDispatched: false,
     lastActivityMs: Date.now(),
     slotHeld: false,
     settled: false,
@@ -1656,9 +1760,12 @@ async function executeJob(job, session) {
           releaseSpawn = await acquireSpawnSlot();
           spawnClaudeProcess(session);
         }
-
+        // A synchronous throw here (EPIPE etc.) means the prompt never left
+        // this process: safe to retry. Once write() returns, the prompt is on
+        // the pipe and the job is DISPATCHED — never re-sent automatically.
         session.process.stdin.write(userEventLine);
-        logEvent(`job ${job.jobId} sent turn prompt to claude stdin (attempt ${attempt}/${MAX_START_ATTEMPTS})`);
+        job.promptDispatched = true;
+        logEvent(`job ${job.jobId} dispatched turn prompt to claude stdin (attempt ${attempt}/${MAX_START_ATTEMPTS}, at-most-once)`);
 
         // Bounded liveness wait: reject on early exit, resolve on first event
         // or after 15s (silent-but-alive processes fall through to the idle
@@ -1668,7 +1775,20 @@ async function executeJob(job, session) {
         break;
       } catch (startErr) {
         logEvent(`job ${job.jobId} process startup attempt ${attempt} failed: ${startErr.message}`);
-        await terminateSessionProcess(session, `startup retry cleanup`);
+        await terminateSessionProcess(session, `startup failure cleanup`);
+        if (job.promptDispatched) {
+          // POST-DISPATCH uncertainty: the prompt reached a claude process
+          // that died before confirming startup. It may have PARTIALLY
+          // EXECUTED (files changed, commands run), so re-sending a
+          // non-idempotent task is unsafe. Fail the job; recovery is the
+          // caller's decision (continue_task / workspace inspection).
+          const err = new Error(
+            `Prompt dispatch outcome uncertain: ${startErr.message}. The task was already written to a claude process that died before confirming startup and may have partially executed. ` +
+            `Automatic re-dispatch is disabled (at-most-once semantics). Inspect the workspace, then resume with continue_task on session ${session.sessionId} if appropriate.`,
+          );
+          err.code = "EDISPATCH_UNCERTAIN";
+          throw err;
+        }
         if (attempt < MAX_START_ATTEMPTS) {
           await sleep(1200 * attempt);
         } else {
@@ -1756,6 +1876,7 @@ function publicJob(job, includeOutput = true) {
     started_at: job.startedAt,
     completed_at: job.completedAt,
     exit_code: job.exitCode,
+    event_seq: job.eventSeq,
   };
 
   if (includeOutput) {
@@ -1820,9 +1941,14 @@ async function dispatch(method, params) {
       const job = jobs.get(params.job_id);
       if (!job) throw new Error(`unknown job_id: ${params.job_id}`);
 
+      const sinceEventSeqRaw = Number(params.since_event_seq);
+      const sinceEventSeq = Number.isFinite(sinceEventSeqRaw) && sinceEventSeqRaw >= 0 ? sinceEventSeqRaw : null;
       const waitMs = Math.min(Number(params.wait_ms) || 0, 45_000);
       if (waitMs > 0 && !TERMINAL_STATUSES.has(job.status)) {
-        const fingerprint = () => `${job.status}|${job.claudeSessionId || ""}|${job.stdout.length}|${job.stderr.length}|${job.progress?.step_index || ""}`;
+        // Wake as soon as ANY meaningful stream event lands (event_seq bumps
+        // on assistant blocks, tool calls/results, api retries, stderr) or the
+        // job settles — not just on step_index/output-length changes.
+        const fingerprint = () => `${job.status}|${job.claudeSessionId || ""}|${job.eventSeq}`;
         const initial = fingerprint();
         const deadline = Date.now() + waitMs;
         while (Date.now() < deadline && !TERMINAL_STATUSES.has(job.status) && fingerprint() === initial) {
@@ -1867,6 +1993,7 @@ let server = null;
 
 if (require.main === module) {
   assertHostUserSecurity();
+  restorePersistedSessions();
 
   server = net.createServer((socket) => {
     clients.add(socket);
@@ -1915,6 +2042,7 @@ if (require.main === module) {
     for (const [id, session] of sessions) {
       if (!session.activeJobId && session.processExited && now - Date.parse(session.lastUsedAt) > JOB_TTL_MS) {
         sessions.delete(id);
+        deleteSessionFile(id);
       }
     }
 
@@ -2010,4 +2138,8 @@ module.exports = {
   assertHostUserSecurity,
   validateRawModels,
   validateFamilyQuality,
+  SESSIONS_STORE_DIR,
+  persistSession,
+  deleteSessionFile,
+  restorePersistedSessions,
 };

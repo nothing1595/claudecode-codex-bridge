@@ -104,26 +104,28 @@ Set `CCB_GATEWAY_REQUIRED=0` to restore the legacy fail-open (CPA-aware) behavio
 4. **Native Permission Bypass & Autonomous Mode**:
    `--dangerously-skip-permissions` (yolo) or `--permission-mode acceptEdits` (safe) enables fully unattended execution without interactive permission pauses.
 5. **Session-Level Lazy Recovery (Fail-Fast & Auto-Resume)**:
-   If the underlying `claude` process terminates or crashes during a turn, the current task fails safely without blind destructive re-execution. The native `claude_session_id` is preserved in the session, and the next `continue_task` call automatically revives the session via `claude --resume <session_id>`.
-6. **Active Process Tree Termination & Clean Shutdown**:
+   If the underlying `claude` process terminates or crashes during a turn, the current task fails safely without blind destructive re-execution. The native `claude_session_id` is preserved in the session, and the next `continue_task` call automatically revives the session via `claude --resume <session_id>`. The csess → claude_session_id mapping is also persisted to `%USERPROFILE%\.claudecode-codex-bridge\sessions\`, so `continue_task` keeps working even across a full broker crash/restart.
+6. **At-Most-Once Prompt Dispatch**:
+   Claude Code only emits `system/init` after the first user message, so startup cannot be confirmed before the prompt is sent. The bridge therefore enforces at-most-once semantics: spawn-level failures *before* the prompt leaves the broker are retried (up to 3 attempts), but once the prompt is written to the claude process's stdin, any subsequent startup failure fails the job with `EDISPATCH_UNCERTAIN` ("prompt may have partially executed") instead of silently re-sending a non-idempotent task. Recovery is always the caller's explicit decision.
+7. **Active Process Tree Termination & Clean Shutdown**:
    When a task exceeds its configured `timeout_minutes`, experiences extended stall silence, or is cancelled, the broker actively and recursively kills the entire subprocess tree (`taskkill /T /F`). When the broker shuts down, it asynchronously awaits process tree termination across all persistent sessions before closing server sockets.
-7. **True Long-Running Task Support (Default 4-Hour Deadline)**:
+8. **True Long-Running Task Support (Default 4-Hour Deadline)**:
    Tasks default to 240 minutes (4 hours, bounded by `CCB_TASK_TIMEOUT_MS`). The bridge never prematurely aborts healthy long-running refactoring or multi-module coding tasks.
-8. **Stream-JSON Result Integrity**:
+9. **Stream-JSON Result Integrity**:
    A turn only succeeds when stream-json delivers a `result` event with `subtype === "success"` and `is_error` falsy. If the CLI process closes unexpectedly (even with exit code 0) before emitting `result`, the turn is immediately and accurately marked as `failed`.
-9. **Visible Desktop CLI Execution Monitor (`claudecode-viewer.cjs`)**:
+10. **Visible Desktop CLI Execution Monitor (`claudecode-viewer.cjs`)**:
    By default on Windows (`CCB_SHOW_WINDOW=1`), when a task is dispatched, a dedicated terminal window titled `Claude Code CLI Monitor - [Model]` pops up on your desktop, rendering a colorized real-time HUD with streaming thoughts, live tool invocations, tool outputs, API retry warnings, and assistant text. The window remains open for review after completion.
-10. **Host User Security Context Bridge (`ClaudeCodeBroker`)**:
+11. **Host User Security Context Bridge (`ClaudeCodeBroker`)**:
     Codex often runs MCP wrappers under a restricted Windows sandbox user account (`codexsandboxoffline`), where Claude Code credentials and gateway tokens do not exist. The bridge registers and utilizes a user-level Windows Scheduled Task (`schtasks /Run /TN ClaudeCodeBroker`) so that the broker daemon is always launched within the interactive host user session, retaining full authenticated access to Claude Code settings, gateway tokens, file permissions, and the desktop display.
-11. **Fast-Path Model Resolution & Non-Idempotent Protection**:
+12. **Fast-Path Model Resolution & Non-Idempotent Protection**:
     Known aliases (`sonnet`, `cc_sonnet_worker`, `opus`, …) resolve instantly in 0ms without touching the gateway. Non-idempotent dispatches (`run_task`, `continue_task`) are strictly protected against duplicate retry loops.
-12. **Reliable Dynamic Model Discovery, Singleton Concurrency & Persistent Caching**:
+13. **Reliable Dynamic Model Discovery, Singleton Concurrency & Persistent Caching**:
     - **Singleflight Singleton Query**: at most one gateway `/v1/models` request runs at any moment.
     - **Finite Retry & Backoff**: queries employ explicit per-attempt timeouts (`CCB_GATEWAY_TIMEOUT_MS`, default 12s), up to 2 retries with linear backoff, and early exit on auth / misconfiguration errors.
     - **Persistent Host Cache**: discovered model families are persisted to `%USERPROFILE%\.claudecode-codex-bridge\models-cache.json` (with timestamps, source, and family counts). Across broker restarts or offline periods, all discovered models remain available immediately.
     - **Non-Destructive Stale Degradation**: if a dynamic refresh fails, the last known complete model list is served with `stale: true` plus `diagnostics`. Temporary failures never overwrite valid caches; built-in aliases (sonnet/opus/haiku/fable) are used only if no cache has ever existed.
     - **Robust Quality Gates**: raw payloads are structurally validated, slugs syntax-checked, duplicates removed, duplicate floods rejected, and severe shrinkage (< 50% family retention vs cache) rejected as `partial_result`.
-13. **Gateway-Aware Effort Handling**:
+14. **Gateway-Aware Effort Handling**:
     Claude Code supports `--effort low|medium|high|xhigh|max`, but gateway model slugs often encode effort themselves (e.g. `fable-test-high`). The bridge only forwards `--effort` when explicitly requested; it never injects one by default.
 
 ---
@@ -145,7 +147,7 @@ Set `CCB_GATEWAY_REQUIRED=0` to restore the legacy fail-open (CPA-aware) behavio
   - Passing `detailed=true` returns an envelope: `{ models, count, stale, source, diagnostics, timestamp }`.
 - **`run_task(workspace, task, model?, effort?, agent?, permission_mode?, timeout_minutes?)`**: Starts a persistent Claude Code session in the workspace. Supports model aliases (e.g. `cc_sonnet_worker`, `sonnet`), gateway slugs, or omitting `model` to use the user-configured default. Defaults to a 240-minute (4-hour) timeout for deep tasks. Fails closed when the CPA gateway is missing, off-allowlist, conflicting, or unreachable (see [CPA-Only Fail-Closed Routing](#cpa-only-fail-closed-routing)).
 - **`continue_task(session_id, task, timeout_minutes?)`**: Sends a follow-up turn prompt directly to the running session's stdin; lazily revives dead sessions via `--resume`.
-- **`get_status(job_id, wait_ms?)`**: Long-polling status and live progress telemetry.
+- **`get_status(job_id, wait_ms?, since_event_seq?)`**: Long-polling status and live progress telemetry. The response carries `event_seq`, incremented on every meaningful stream event (assistant text/thinking/tool_use, tool results, api retries, stderr); passing it back as `since_event_seq` wakes the poll immediately on any new activity instead of waiting out the full window.
 - **`cancel_task(job_id)`**: Gracefully stops the active turn and halts the subprocess tree.
 
 ---
@@ -186,8 +188,8 @@ Restart Codex, then ask it to assign **`cc_worker`**.
 | `CCB_BROKER_IDLE_MS` | `0` (persistent) | Broker auto-exit timeout when idle. |
 | `CCB_TASK_TIMEOUT_MS` | `14400000` (4h) | Hard deadline timeout for a single task. |
 | `CCB_DEFAULT_TIMEOUT_MINUTES` | `240` (4h) | Default per-task timeout when `timeout_minutes` is omitted or invalid. |
-| `CCB_TASK_IDLE_TIMEOUT_MS` | `600000` (10m) | Stall detection: silence timeout before failing job. |
-| `CCB_TASK_TOOL_IDLE_TIMEOUT_MS` | `3600000` (60m) | Silence timeout while the latest stream step is a tool execution. |
+| `CCB_TASK_IDLE_TIMEOUT_MS` | `1800000` (30m) | Stall detection: stream-silence timeout before failing a job (generous enough for long model thinking / backend waits). |
+| `CCB_TASK_TOOL_IDLE_TIMEOUT_MS` | `5400000` (90m) | Silence timeout while the latest stream step is a tool execution (long local commands / experiments). |
 | `CCB_SHOW_WINDOW` | `1` | Set to `1` to pop up the desktop CLI monitor window, `0` for headless. |
 | `CCB_GATEWAY_BASE_URL` | From `~/.claude/settings.json` | Override the model discovery gateway base URL (tests). |
 | `CCB_GATEWAY_AUTH_TOKEN` | From `~/.claude/settings.json` | Override the gateway auth token (tests). |
@@ -201,6 +203,7 @@ Restart Codex, then ask it to assign **`cc_worker`**.
 | `CCB_GATEWAY_BACKOFF_MS` | `800` | Linear backoff delay multiplier. |
 | `CCB_USER_PROFILE` | `C:\Users\15869` | Host user profile the broker executes under. |
 | `CCB_BROKER_LOG` | `%TEMP%\claudecode-broker.log` | Broker diagnostic log path. |
+| `CCB_SESSIONS_DIR` | `%USERPROFILE%\.claudecode-codex-bridge\sessions` | Durable session registry (csess → claude_session_id mapping) restored on broker restart. |
 
 ---
 

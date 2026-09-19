@@ -234,7 +234,7 @@ const tools = [
   },
   {
     name: "get_status",
-    description: "Get status, progress, and output for a Claude Code job. Statuses: queued, running, completed, failed, cancelled. Supports server-side long polling via wait_ms (recommended: 40000) to avoid busy-polling.",
+    description: "Get status, progress, and output for a Claude Code job. Statuses: queued, running, completed, failed, cancelled. Supports server-side long polling via wait_ms (recommended: 40000) to avoid busy-polling. The response includes event_seq, which increments on every meaningful stream event (assistant text/thinking/tool_use blocks, tool results, api retries, stderr, results) — pass it back as since_event_seq on the next poll to be woken immediately when anything new happens.",
     inputSchema: {
       type: "object",
       properties: {
@@ -246,6 +246,10 @@ const tools = [
           type: "number",
           description: "Hold response until status or progress changes, up to 45000 ms. Recommended: 40000.",
           default: 40000,
+        },
+        since_event_seq: {
+          type: "number",
+          description: "Optional: the event_seq value from your previous get_status response. Returns immediately once the job's event_seq exceeds this value.",
         },
       },
       required: ["job_id"],
